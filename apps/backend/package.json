@@ -7,6 +7,8 @@
     "@types/bun": "latest",
     "@types/express": "^5.0.6",
     "@types/node": "^26.0.1",
+    "@types/pg": "^8.20.0",
+    "@types/ws": "^8.18.1",
     "prisma": "^7.8.0"
   },
   "scripts": {
@@ -16,10 +18,13 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@prisma/extension-accelerate": "^3.0.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "pg": "^8.22.0",
+    "ws": "^8.21.0",
     "zod": "^4.4.3"
   }
 }

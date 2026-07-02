@@ -23,10 +23,10 @@ export function App() {
 
   return (
     <>
-      {currentPath === "/interview" ? (
+      {currentPath.startsWith("/interview") ? (
         <InterviewPage onExit={() => navigate("/")} />
       ) : (
-        <Welcome onStart={() => navigate("/interview")} />
+        <Welcome onStart={(id) => navigate(`/interview?id=${id}`)} />
       )}
     </>
   );

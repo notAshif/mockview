@@ -1,27 +1,15 @@
 import React, { useState, useEffect, useRef } from "react";
 import { 
-  Camera, 
-  CameraOff, 
   Mic, 
   MicOff, 
-  Monitor, 
-  Settings, 
-  Volume2, 
-  VolumeX, 
   Clock, 
   ArrowLeft, 
   Wifi, 
   Send, 
-  Sparkles, 
-  Activity, 
-  CheckCircle2, 
-  AlertCircle,
-  Sliders,
-  Play,
   RotateCcw
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import {
   Select,
   SelectContent,
@@ -29,6 +17,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import bgHero from "./assets/bg_hero.jpg";
+import { playAestheticClick } from "./lib/utils";
 
 // CSS Animations as inline style tag to guarantee custom visual effects work in this template
 const customStyles = `
@@ -130,9 +120,9 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
   const [selectedPersona, setSelectedPersona] = useState<Persona>(PERSONAS[0]!);
   const [assistantState, setAssistantState] = useState<AssistantState>("idle");
   const [timer, setTimer] = useState(0);
+  const [resetCounter, setResetCounter] = useState(0);
 
   // User media states
-  const [cameraOn, setCameraOn] = useState(true);
   const [micOn, setMicOn] = useState(true);
   const [cameraPermission, setCameraPermission] = useState<"pending" | "granted" | "denied">("pending");
   const [audioLevel, setAudioLevel] = useState(0);
@@ -140,38 +130,27 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
   // Chat & responses state
   const [textInput, setTextInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
 
-  // Feedback Metrics (simulated dynamically)
+  // Feedback Metrics (computed dynamically from actual voice transcripts)
   const [metrics, setMetrics] = useState({
-    pacing: 140, // WPM
+    pacing: 0, // WPM
     fillers: 0,
-    clarity: 95, // %
+    clarity: 98, // %
     structure: "Not Started"
   });
 
-  const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
-  // Load Initial Persona Prompt
-  useEffect(() => {
-    setMessages([
-      {
-        sender: "assistant",
-        text: selectedPersona.initialPrompt,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      }
-    ]);
-    setAssistantState("speaking");
-    setCurrentQuestionIndex(0);
-    setMetrics({
-      pacing: 0,
-      fillers: 0,
-      clarity: 98,
-      structure: "STAR - Hook"
-    });
-  }, [selectedPersona]);
+  // WebSocket and Audio Refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const recorderContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const nextPlaybackTimeRef = useRef<number>(0);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
 
   // Session timer count up
   useEffect(() => {
@@ -193,17 +172,244 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Request & Bind Webcam
+  // Audio Playback scheduler for 24kHz PCM chunks from Gemini
+  const playAudioChunk = async (base64Data: string) => {
+    try {
+      if (!playbackContextRef.current) {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        playbackContextRef.current = new AudioContextClass();
+        nextPlaybackTimeRef.current = playbackContextRef.current.currentTime;
+      }
+      
+      const ctx = playbackContextRef.current;
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+      
+      const binaryString = atob(base64Data);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      
+      const dataView = new DataView(bytes.buffer);
+      const sampleCount = len / 2;
+      const floatBuffer = new Float32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        const int16 = dataView.getInt16(i * 2, true);
+        floatBuffer[i] = int16 / 32768.0;
+      }
+      
+      const audioBuffer = ctx.createBuffer(1, sampleCount, 24000);
+      audioBuffer.getChannelData(0).set(floatBuffer);
+      
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      
+      const startTime = Math.max(ctx.currentTime, nextPlaybackTimeRef.current);
+      source.start(startTime);
+      
+      nextPlaybackTimeRef.current = startTime + audioBuffer.duration;
+      activeSourcesRef.current.push(source);
+      
+      source.onended = () => {
+        activeSourcesRef.current = activeSourcesRef.current.filter(src => src !== source);
+      };
+    } catch (e) {
+      console.warn("Failed to play audio chunk:", e);
+    }
+  };
+
+  const stopAllPlayback = () => {
+    activeSourcesRef.current.forEach(source => {
+      try {
+        source.stop();
+      } catch (e) {}
+    });
+    activeSourcesRef.current = [];
+    if (playbackContextRef.current) {
+      nextPlaybackTimeRef.current = playbackContextRef.current.currentTime;
+    }
+  };
+
+  // Audio Recording (capture, resample to 16kHz PCM mono and stream)
+  const startRecording = (ws: WebSocket, stream: MediaStream) => {
+    try {
+      if (recorderContextRef.current) return;
+      
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioContextClass({ sampleRate: 16000 });
+      recorderContextRef.current = audioContext;
+      
+      const source = audioContext.createMediaStreamSource(stream);
+      sourceRef.current = source;
+      
+      const processor = audioContext.createScriptProcessor(2048, 1, 1);
+      processorRef.current = processor;
+      
+      processor.onaudioprocess = (e) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        const pcmBuffer = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]!));
+          pcmBuffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        ws.send(pcmBuffer.buffer);
+      };
+      
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      console.log("[Client] Started audio streaming at 16kHz PCM");
+    } catch (err) {
+      console.error("[Client] Failed to start audio streaming:", err);
+    }
+  };
+
+  const stopRecording = () => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    if (recorderContextRef.current) {
+      recorderContextRef.current.close().catch(() => {});
+      recorderContextRef.current = null;
+    }
+    console.log("[Client] Stopped audio streaming");
+  };
+
+  // WebSocket Connection Lifecycle
   useEffect(() => {
-    async function startCamera() {
-      // If camera is disabled, clean up previous streams
-      if (!cameraOn) {
+    const queryParams = new URLSearchParams(window.location.search);
+    const id = queryParams.get("id");
+    if (!id) {
+      alert("No Interview Session ID found. Returning to welcome page.");
+      onExit();
+      return;
+    }
+
+    console.log(`[Client] Initializing WebSocket session for ${id}`);
+    const ws = new WebSocket(`ws://localhost:3001/api/interviews/${id}?persona=${selectedPersona.id}`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("[Client] WebSocket opened");
+      if (micOn && streamRef.current) {
+        startRecording(ws, streamRef.current);
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        
+        switch (payload.type) {
+          case "status":
+            setAssistantState(payload.status);
+            break;
+          case "audio":
+            playAudioChunk(payload.data);
+            break;
+          case "text":
+            // Append incoming assistant text chunks
+            setMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.sender === "assistant") {
+                return [
+                  ...prev.slice(0, -1),
+                  { ...lastMsg, text: lastMsg.text + payload.text }
+                ];
+              } else {
+                return [
+                  ...prev,
+                  {
+                    sender: "assistant",
+                    text: payload.text,
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  }
+                ];
+              }
+            });
+            break;
+          case "user_transcript": {
+            const text = payload.text;
+            setMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.sender === "user") {
+                return [
+                  ...prev.slice(0, -1),
+                  { ...lastMsg, text }
+                ];
+              } else {
+                return [
+                  ...prev,
+                  {
+                    sender: "user",
+                    text,
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  }
+                ];
+              }
+            });
+
+            // Update real-time feedback metrics from actual user transcript
+            const words = text.split(/\s+/).length;
+            const currentPacing = Math.min(180, Math.max(90, Math.floor((words / 12) * 125)));
+            const umCount = (text.toLowerCase().match(/\b(um|uh|like|so|basically)\b/g) || []).length;
+            setMetrics(prev => ({
+              pacing: currentPacing,
+              fillers: prev.fillers + umCount,
+              clarity: Math.max(75, 98 - (umCount * 3)),
+              structure: text.length > 80 ? "STAR - Action" : "STAR - Situation"
+            }));
+            break;
+          }
+          case "interrupted":
+            console.log("[Client] Assistant interrupted by user speak");
+            stopAllPlayback();
+            setAssistantState("listening");
+            break;
+          case "error":
+            console.error("[Client] Backend error:", payload.message);
+            alert(`Error: ${payload.message}`);
+            break;
+        }
+      } catch (err) {
+        console.error("[Client] Error parsing WebSocket message:", err);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("[Client] WebSocket closed");
+      setAssistantState("idle");
+    };
+
+    return () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+      stopRecording();
+      stopAllPlayback();
+      setMessages([]);
+      setTimer(0);
+    };
+  }, [selectedPersona.id, resetCounter]);
+
+  // Request & Bind Microphone Stream ONLY
+  useEffect(() => {
+    async function startAudio() {
+      if (!micOn) {
+        stopRecording();
         if (streamRef.current) {
           streamRef.current.getTracks().forEach(track => track.stop());
           streamRef.current = null;
-        }
-        if (videoRef.current) {
-          videoRef.current.srcObject = null;
         }
         return;
       }
@@ -211,37 +417,35 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
       setCameraPermission("pending");
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: micOn
+          audio: true
         });
         
         streamRef.current = stream;
         setCameraPermission("granted");
         
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          startRecording(wsRef.current, stream);
         }
       } catch (err) {
-        console.error("Camera access failed:", err);
+        console.error("Microphone access failed:", err);
         setCameraPermission("denied");
       }
     }
 
-    startCamera();
+    startAudio();
 
     return () => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
     };
-  }, [cameraOn]);
+  }, [micOn]);
 
   // Microphone Audio Level Meter (Web Audio API)
   useEffect(() => {
     let audioContext: AudioContext | null = null;
     let analyser: AnalyserNode | null = null;
     let microphone: MediaStreamAudioSourceNode | null = null;
-    let javascriptNode: ScriptProcessorNode | null = null;
     let animationFrameId: number;
 
     if (micOn && streamRef.current && cameraPermission === "granted") {
@@ -264,7 +468,6 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
             sum += dataArray[i]!;
           }
           const average = sum / bufferLength;
-          // Scale from 0-255 to 0-100
           setAudioLevel(Math.min(100, Math.floor((average / 128) * 100)));
           animationFrameId = requestAnimationFrame(updateVolume);
         };
@@ -287,123 +490,50 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
   // Handle user response submission
   const handleSubmitAnswer = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!textInput.trim()) return;
+    if (!textInput.trim() || !wsRef.current) return;
 
-    // 1. Add user message
+    // 1. Add user message locally
     const newMsg: Message = {
       sender: "user",
       text: textInput,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
     setMessages(prev => [...prev, newMsg]);
-    const responseText = textInput;
+
+    // 2. Send text to backend WebSocket
+    wsRef.current.send(JSON.stringify({ type: "text", text: textInput }));
     setTextInput("");
-
-    // 2. Change AI state to listening, then thinking
-    setAssistantState("listening");
-    
-    // Simulate real-time metrics parsing
-    const wordCount = responseText.split(/\s+/).length;
-    const currentPacing = Math.min(180, Math.max(90, Math.floor((wordCount / 10) * 140)));
-    const umCount = (responseText.toLowerCase().match(/\b(um|uh|like|so|basically)\b/g) || []).length;
-    
-    setTimeout(() => {
-      setAssistantState("thinking");
-      
-      // Update stats based on user response
-      setMetrics(prev => ({
-        pacing: currentPacing,
-        fillers: prev.fillers + umCount,
-        clarity: Math.max(70, 98 - (umCount * 4)),
-        structure: responseText.length > 80 ? "STAR - Action" : "STAR - Situation"
-      }));
-
-      // 3. Trigger next question after "thinking" delay
-      setTimeout(() => {
-        setAssistantState("speaking");
-        const nextQuestion = selectedPersona.questions[currentQuestionIndex];
-        
-        if (nextQuestion) {
-          setMessages(prev => [...prev, {
-            sender: "assistant",
-            text: nextQuestion,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          }]);
-          setCurrentQuestionIndex(prev => prev + 1);
-        } else {
-          setMessages(prev => [...prev, {
-            sender: "assistant",
-            text: "That was the last of my questions. You did exceptionally well navigating these scenarios! I've logged your metrics. Feel free to review them or reset the session.",
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          }]);
-          setAssistantState("idle");
-        }
-      }, 2500);
-
-    }, 1200);
   };
 
-  // Mock speech engine cycle trigger (next question simulation)
-  const handleSimulateState = (state: AssistantState) => {
-    setAssistantState(state);
-    if (state === "speaking") {
-      const nextQuestion = selectedPersona.questions[currentQuestionIndex];
-      if (nextQuestion) {
-        setMessages(prev => [...prev, {
-          sender: "assistant",
-          text: nextQuestion,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }]);
-        setCurrentQuestionIndex(prev => prev + 1);
-      } else {
-        setMessages(prev => [...prev, {
-          sender: "assistant",
-          text: "Let me summarize. Your approach highlights excellent distribution architecture. Would you like to restart the session or look at the performance logs?",
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }]);
-        setAssistantState("idle");
-      }
+  // End Interview and notify backend to save status
+  const handleEndInterview = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "end" }));
     }
+    stopRecording();
+    stopAllPlayback();
+    onExit();
   };
 
-  // Reset current session
   const handleResetSession = () => {
-    setMessages([
-      {
-        sender: "assistant",
-        text: selectedPersona.initialPrompt,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      }
-    ]);
-    setAssistantState("speaking");
-    setCurrentQuestionIndex(0);
-    setTimer(0);
-    setMetrics({
-      pacing: 0,
-      fillers: 0,
-      clarity: 98,
-      structure: "STAR - Hook"
-    });
+    setResetCounter(prev => prev + 1);
   };
 
-  // Helper to generate dynamic height/scale for equalizer bars
   const getEqualizerStyle = (index: number) => {
-    if (!micOn) return { height: "4px" };
-    // Mix active stream level with offset for variance
-    const multiplier = 0.4 + (index * 0.15);
-    const heightVal = Math.max(4, Math.floor(audioLevel * multiplier));
+    if (!micOn) return { height: "3px" };
+    const multiplier = 0.3 + (index * 0.12);
+    const heightVal = Math.max(3, Math.floor(audioLevel * multiplier));
     return {
-      height: `${Math.min(32, heightVal)}px`,
+      height: `${Math.min(20, heightVal)}px`,
       transition: "height 0.08s ease"
     };
   };
 
-  // Decide Orb visual classes based on state
   const getOrbStateConfig = () => {
     switch (assistantState) {
       case "listening":
         return {
-          gradient: "from-[#0D9488] via-[#06B6D4] to-[#3B82F6]", // Teal / Cyan / Blue
+          gradient: "from-[#0D9488] via-[#06B6D4] to-[#3B82F6]",
           scale: "scale-105",
           ringColor: "border-[#06B6D4]/30",
           shadowColor: "shadow-[0_0_50px_20px_rgba(6,182,212,0.35)]",
@@ -411,7 +541,7 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
         };
       case "thinking":
         return {
-          gradient: "from-[#6366F1] via-[#8B5CF6] to-[#EC4899]", // Indigo / Purple / Pink
+          gradient: "from-[#6366F1] via-[#8B5CF6] to-[#EC4899]",
           scale: "scale-100 rotate-180",
           ringColor: "border-[#8B5CF6]/30",
           shadowColor: "shadow-[0_0_50px_20px_rgba(139,92,246,0.35)]",
@@ -419,7 +549,7 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
         };
       case "speaking":
         return {
-          gradient: `from-[#C17F3B] via-[#D18F4B] to-[#EF4444]`, // Amber / Gold / Coral
+          gradient: "from-[#C17F3B] via-[#D18F4B] to-[#EF4444]",
           scale: "scale-110",
           ringColor: "border-[#C17F3B]/30",
           shadowColor: "shadow-[0_0_60px_25px_rgba(193,127,59,0.35)]",
@@ -428,10 +558,10 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
       case "idle":
       default:
         return {
-          gradient: "from-[#4B5563] via-[#374151] to-[#1F2937]", // Slate / Dark Gray
+          gradient: "from-[#8E877F] via-[#A8A095] to-[#C0B7AB]",
           scale: "scale-95",
-          ringColor: "border-white/5",
-          shadowColor: "shadow-[0_0_30px_10px_rgba(255,255,255,0.05)]",
+          ringColor: "border-[#0B0909]/20",
+          shadowColor: "shadow-[0_0_30px_10px_rgba(11,9,9,0.05)]",
           label: "STANDBY"
         };
     }
@@ -440,269 +570,154 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
   const orbConfig = getOrbStateConfig();
 
   return (
-    <div className="flex flex-col h-screen max-h-screen bg-[#0B0C0E] text-[#F5F0E8] overflow-y-auto overflow-x-hidden no-scrollbar relative font-sans">
+    <div 
+      className="flex flex-col h-screen max-h-screen bg-[#FBEFEF] bg-cover bg-center overflow-y-auto overflow-x-hidden no-scrollbar relative font-sans text-[#0B0909]"
+      style={{ backgroundImage: `url(${bgHero})` }}
+    >
       <style dangerouslySetInnerHTML={{ __html: customStyles }} />
 
-      {/* Subtle background glow */}
-      <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-[#C17F3B]/5 blur-[120px] pointer-events-none" />
-      <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full bg-[#8B5CF6]/5 blur-[120px] pointer-events-none" />
+      {/* Backdrop glass layer */}
+      <div className="absolute inset-0 bg-[#FBEFEF]/30 backdrop-blur-[0.5px] pointer-events-none" />
 
       {/* Top Header */}
-      <header className="flex justify-between items-center px-6 py-4 border-b border-[#1E2024] bg-[#0E1013]/80 backdrop-blur-md sticky top-0 z-40">
+      <header className="flex justify-between items-center px-6 py-4 border-b-2 border-[#0B0909] bg-[#FBEFEF]/95 backdrop-blur-md sticky top-0 z-40">
         <div className="flex items-center gap-3.5">
           <button 
-            onClick={onExit}
-            className="flex items-center justify-center p-2 rounded-lg bg-[#16181C] hover:bg-[#202329] border border-[#2A2D33]/60 transition-colors text-[#8A8F98] hover:text-[#F5F0E8] cursor-pointer"
+            onClick={() => {
+              playAestheticClick();
+              handleEndInterview();
+            }}
+            className="flex items-center justify-center p-2 rounded-xl bg-[#EEEEEE] hover:bg-neutral-200 border-2 border-[#0B0909] shadow-[2px_2px_0px_0px_#0B0909] transition-all active:translate-y-[1px] active:shadow-[1px_1px_0px_0px_#0B0909] text-[#0B0909] cursor-pointer"
           >
             <ArrowLeft className="size-4" />
           </button>
           <div className="flex flex-col">
-            <span className="text-xs uppercase tracking-[0.2em] text-[#8A8F98] font-semibold">Mockview</span>
-            <span className="text-sm font-medium text-[#F5F0E8]">AI Interview Simulator</span>
+            <span className="text-xs uppercase tracking-[0.2em] text-[#0B0909] font-extrabold">Mockview</span>
+            <span className="text-sm font-bold text-[#0B0909]">AI Interview Simulator</span>
           </div>
         </div>
 
         {/* Live Timer & Connection Status */}
-        <div className="flex items-center gap-6">
-          <div className="hidden sm:flex items-center gap-2 bg-[#16181C] border border-[#2A2D33]/40 rounded-full py-1.5 px-3">
+        <div className="flex items-center gap-4 sm:gap-6">
+          <div className="hidden sm:flex items-center gap-2 bg-[#EEEEEE] border-2 border-[#0B0909] shadow-[2px_2px_0px_0px_#0B0909] rounded-full py-1.5 px-3">
             <span className="relative flex h-2 w-2">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
             </span>
-            <span className="text-[11px] font-semibold text-emerald-500 uppercase tracking-wider">LIVE</span>
-            <div className="w-[1px] h-3 bg-[#2A2D33] mx-1" />
-            <Clock className="size-3.5 text-[#8A8F98]" />
-            <span className="text-xs font-mono text-[#F5F0E8]">{formatTime(timer)}</span>
+            <span className="text-[10px] font-extrabold text-emerald-700 uppercase tracking-wider">LIVE</span>
+            <div className="w-[1px] h-3 bg-[#0B0909]/30 mx-1" />
+            <Clock className="size-3.5 text-[#0B0909]" />
+            <span className="text-xs font-mono font-bold text-[#0B0909]">{formatTime(timer)}</span>
           </div>
 
-          <div className="flex items-center gap-1.5 text-xs text-[#8A8F98]">
-            <Wifi className="size-3.5 text-emerald-500 animate-pulse" />
-            <span>124ms Latency</span>
+          <div className="flex items-center gap-1.5 text-xs text-[#0B0909] font-bold">
+            <Wifi className="size-3.5 text-emerald-600 animate-pulse" />
+            <span>124ms</span>
           </div>
 
           <Button 
             variant="destructive"
             size="sm"
-            onClick={onExit}
-            className="rounded-lg h-9 px-4 font-medium transition-transform active:scale-95 cursor-pointer"
+            onClick={() => {
+              playAestheticClick();
+              handleEndInterview();
+            }}
+            className="rounded-xl h-9 px-4 font-bold border-2 border-[#0B0909] bg-[#0B0909] text-[#FBEFEF] hover:bg-[#0B0909]/95 transition-all active:scale-[0.98] cursor-pointer shadow-[2px_2px_0px_0px_#EEEEEE]"
           >
             End Interview
           </Button>
         </div>
       </header>
 
-      {/* Main Grid Content */}
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6 p-6 max-w-7xl mx-auto w-full">
-        
-        {/* LEFT COLUMN: Camera & Audio Visualizer (7 cols on desktop) */}
-        <section className="lg:col-span-7 flex flex-col gap-5">
-          <Card className="bg-[#121418]/80 backdrop-blur-xl border-[#1E2024] shadow-2xl overflow-hidden relative aspect-video w-full flex flex-col justify-between py-0">
-            {/* Top Stats HUD Overlay */}
-            <div className="absolute top-4 left-4 right-4 flex justify-between items-start z-10 pointer-events-none">
-              <div className="flex items-center gap-2 bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/5">
-                <div className="size-2 rounded-full bg-rose-500 animate-pulse" />
-                <span className="text-[10px] font-semibold tracking-wider uppercase text-rose-400">REC CAM</span>
-              </div>
-
-              {/* Dynamic Sound Equalizer HUD */}
-              <div className="flex items-end gap-[3px] bg-black/40 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/5 h-8">
-                <span className="text-[9px] text-[#8A8F98] mr-1.5 uppercase font-medium self-center">Mic Level</span>
-                {[...Array(6)].map((_, i) => (
-                  <div 
-                    key={i} 
-                    style={getEqualizerStyle(i)}
-                    className="w-1.5 bg-gradient-to-t from-emerald-500 to-teal-400 rounded-full"
-                  />
-                ))}
-              </div>
-            </div>
-
-            {/* Video Feed Area */}
-            <div className="flex-1 w-full h-full relative bg-[#090A0C] flex items-center justify-center">
-              {cameraOn && cameraPermission === "granted" ? (
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className="w-full h-full object-cover scale-x-[-1]" 
-                />
-              ) : (
-                /* Sleek Dark Fallback Avatar */
-                <div className="flex flex-col items-center justify-center text-center p-6 w-full h-full">
-                  <div className="relative mb-4">
-                    <div className="absolute inset-0 bg-[#C17F3B]/10 rounded-full blur-xl animate-pulse" />
-                    <div className="relative size-24 rounded-full bg-[#1A1C20] border-2 border-[#2A2D33] flex items-center justify-center text-[#C17F3B] shadow-inner">
-                      <CameraOff className="size-8 text-[#8A8F98]" />
-                    </div>
-                  </div>
-                  <h3 className="text-sm font-medium text-[#F5F0E8]">
-                    {cameraOn ? "Requesting Camera Access..." : "Camera Switched Off"}
-                  </h3>
-                  <p className="text-xs text-[#8A8F98] max-w-[240px] mt-1 leading-relaxed">
-                    {cameraOn 
-                      ? "Please grant webcam permissions in your browser to view your video feed."
-                      : "Turn on your camera below to see yourself during the interview."}
-                  </p>
-                </div>
-              )}
-
-              {/* Glowing bottom overlay on live video */}
-              {cameraOn && cameraPermission === "granted" && (
-                <div className="absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/60 to-transparent pointer-events-none" />
-              )}
-            </div>
-
-            {/* Float HUD Controls */}
-            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-black/50 backdrop-blur-md border border-white/10 rounded-full px-5 py-2.5 z-10 shadow-lg">
-              <button
-                type="button"
-                onClick={() => setMicOn(!micOn)}
-                className={`flex items-center justify-center size-10 rounded-full transition-colors cursor-pointer ${
-                  micOn 
-                    ? "bg-white/10 hover:bg-white/20 text-[#F5F0E8]" 
-                    : "bg-red-500/80 hover:bg-red-600/90 text-white"
-                }`}
-                title={micOn ? "Mute Microphone" : "Unmute Microphone"}
-              >
-                {micOn ? <Mic className="size-4" /> : <MicOff className="size-4" />}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setCameraOn(!cameraOn)}
-                className={`flex items-center justify-center size-10 rounded-full transition-colors cursor-pointer ${
-                  cameraOn 
-                    ? "bg-white/10 hover:bg-white/20 text-[#F5F0E8]" 
-                    : "bg-red-500/80 hover:bg-red-600/90 text-white"
-                }`}
-                title={cameraOn ? "Turn Camera Off" : "Turn Camera On"}
-              >
-                {cameraOn ? <Camera className="size-4" /> : <CameraOff className="size-4" />}
-              </button>
-
-              <button
-                type="button"
-                className="flex items-center justify-center size-10 rounded-full bg-white/10 hover:bg-white/20 text-[#F5F0E8] transition-colors cursor-pointer"
-                title="Share Screen (Mock)"
-              >
-                <Monitor className="size-4" />
-              </button>
-
-              <div className="w-[1px] h-5 bg-white/15 mx-1" />
-
-              <button
-                type="button"
-                className="flex items-center justify-center size-10 rounded-full bg-white/10 hover:bg-white/20 text-[#F5F0E8] transition-colors cursor-pointer"
-                title="Camera & Microphone Settings"
-              >
-                <Sliders className="size-4" />
-              </button>
-            </div>
-          </Card>
-
-          {/* REAL-TIME FEEDBACK HUD */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <Card className="bg-[#121418]/60 border-[#1E2024] py-3.5 px-4 shadow-sm flex flex-col justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-[#8A8F98] font-semibold">Pacing Speed</span>
-              <div className="flex items-baseline gap-1 mt-1">
-                <span className="text-xl font-bold text-[#F5F0E8]">{metrics.pacing || "--"}</span>
-                <span className="text-[10px] text-[#8A8F98]">WPM</span>
-              </div>
-              <span className="text-[9px] text-emerald-500 font-medium mt-0.5">● Optimal Range</span>
-            </Card>
-
-            <Card className="bg-[#121418]/60 border-[#1E2024] py-3.5 px-4 shadow-sm flex flex-col justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-[#8A8F98] font-semibold">Filler Words</span>
-              <div className="flex items-baseline gap-1 mt-1">
-                <span className="text-xl font-bold text-[#F5F0E8]">{metrics.fillers}</span>
-                <span className="text-[10px] text-[#8A8F98]">counts</span>
-              </div>
-              <span className="text-[9px] text-[#8A8F98] font-medium mt-0.5">Um, basic, like</span>
-            </Card>
-
-            <Card className="bg-[#121418]/60 border-[#1E2024] py-3.5 px-4 shadow-sm flex flex-col justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-[#8A8F98] font-semibold">Clarity Score</span>
-              <div className="flex items-baseline gap-1 mt-1">
-                <span className="text-xl font-bold text-[#F5F0E8]">{metrics.clarity}%</span>
-              </div>
-              <span className="text-[9px] text-emerald-500 font-medium mt-0.5">● High Pronunciation</span>
-            </Card>
-
-            <Card className="bg-[#121418]/60 border-[#1E2024] py-3.5 px-4 shadow-sm flex flex-col justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-[#8A8F98] font-semibold">Structure Map</span>
-              <div className="flex items-baseline gap-1 mt-1">
-                <span className="text-sm font-bold text-[#C17F3B] truncate max-w-full">{metrics.structure}</span>
-              </div>
-              <span className="text-[9px] text-[#8A8F98] font-medium mt-0.5">STAR Framework</span>
-            </Card>
-          </div>
-
-          {/* AI PERSONA CARD DESCRIPTION */}
-          <Card className="bg-[#121418]/40 border-[#1E2024] p-4 flex gap-4 items-start shadow-sm">
-            <div className={`p-2.5 rounded-xl bg-gradient-to-tr ${selectedPersona.color} text-black shrink-0 shadow-md`}>
-              <Sparkles className="size-5" />
-            </div>
-            <div className="flex-1">
-              <h4 className="text-xs font-semibold uppercase tracking-wider text-[#8A8F98]">Active Persona Profile</h4>
-              <p className="text-sm font-semibold text-[#F5F0E8] mt-0.5">{selectedPersona.name} ({selectedPersona.role})</p>
-              <p className="text-xs text-[#8A8F98] mt-1 leading-relaxed">{selectedPersona.description}</p>
-            </div>
-          </Card>
-        </section>
-
-        {/* RIGHT COLUMN: Voice Assistant UI & Transcripts (5 cols on desktop) */}
-        <section className="lg:col-span-5 flex flex-col gap-5 h-full">
-          <Card className="bg-[#121418]/80 backdrop-blur-xl border-[#1E2024] shadow-2xl flex flex-col justify-between overflow-hidden h-[540px] py-5">
+      {/* Main Centered Content Layout (No Camera Feed) */}
+      <main className="flex-1 flex items-center justify-center p-6 max-w-2xl mx-auto w-full relative z-10">
+        <section className="flex flex-col gap-5 w-full">
+          <Card className="bg-[#FBEFEF]/95 border-2 border-[#0B0909] shadow-[6px_6px_0px_0px_#0B0909] flex flex-col justify-between overflow-hidden h-[550px] py-5 rounded-3xl text-[#0B0909]">
             
-            {/* Header: Select Persona */}
-            <div className="border-b border-[#1E2024] pb-4 px-6 flex justify-between items-center">
-              <div className="flex flex-col gap-0.5">
-                <span className="text-[10px] uppercase tracking-wider text-[#8A8F98] font-semibold">Voice Interviewer</span>
-                <Select
-                  value={selectedPersona.id}
-                  onValueChange={(val) => {
-                    const found = PERSONAS.find(p => p.id === val);
-                    if (found) setSelectedPersona(found);
-                  }}
-                >
-                  <SelectTrigger className="w-[190px] border-[#2A2D33] text-sm bg-transparent hover:bg-[#16181C] text-[#F5F0E8] cursor-pointer">
-                    <SelectValue placeholder="Select Interviewer" />
-                  </SelectTrigger>
-                  <SelectContent className="bg-[#16181C] border-[#2A2D33] text-[#F5F0E8]">
-                    {PERSONAS.map(p => (
-                      <SelectItem key={p.id} value={p.id} className="cursor-pointer hover:bg-[#202329] focus:bg-[#202329]">
-                        {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+            {/* Header: Select Persona & Status / Candidate Mic */}
+            <div className="border-b-2 border-[#0B0909]/20 pb-4 px-6 flex flex-wrap justify-between items-center gap-3">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] uppercase tracking-wider text-[#0B0909]/70 font-extrabold">Interviewer Profile</span>
+                <div className="flex items-center gap-2">
+                  <Select
+                    value={selectedPersona.id}
+                    onValueChange={(val) => {
+                      playAestheticClick();
+                      const found = PERSONAS.find(p => p.id === val);
+                      if (found) setSelectedPersona(found);
+                    }}
+                  >
+                    <SelectTrigger className="w-[150px] border-2 border-[#0B0909] text-xs bg-[#EEEEEE] hover:bg-[#EEEEEE]/90 text-[#0B0909] font-bold cursor-pointer rounded-xl h-8">
+                      <SelectValue placeholder="Select Interviewer" />
+                    </SelectTrigger>
+                    <SelectContent className="bg-[#FBEFEF] border-2 border-[#0B0909] text-[#0B0909] rounded-xl">
+                      {PERSONAS.map(p => (
+                        <SelectItem key={p.id} value={p.id} className="cursor-pointer hover:bg-[#EEEEEE]/40 focus:bg-[#EEEEEE]/40 rounded-lg">
+                          {p.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  <button 
+                    type="button"
+                    onClick={() => {
+                      playAestheticClick();
+                      handleResetSession();
+                    }}
+                    className="flex items-center justify-center size-8 rounded-xl bg-[#EEEEEE] hover:bg-neutral-200 border-2 border-[#0B0909] text-[#0B0909] shadow-[1px_1px_0px_0px_#0B0909] transition-all active:translate-y-[1px] active:shadow-none cursor-pointer"
+                    title="Restart Interview Session"
+                  >
+                    <RotateCcw className="size-3.5" />
+                  </button>
+                </div>
               </div>
 
-              {/* Status indicator */}
-              <div className="flex flex-col items-end gap-1">
-                <span className="text-[9px] uppercase tracking-widest text-[#8A8F98] font-bold">AI Status</span>
-                <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2 py-0.5 rounded-full border ${
-                  assistantState === "listening" ? "text-cyan-400 bg-cyan-950/20 border-cyan-800/30 animate-pulse" :
-                  assistantState === "thinking" ? "text-indigo-400 bg-indigo-950/20 border-indigo-800/30" :
-                  assistantState === "speaking" ? "text-amber-400 bg-amber-950/20 border-amber-800/30" :
-                  "text-[#8A8F98] bg-[#16181C] border-[#2A2D33]/30"
-                }`}>
-                  <span className={`size-1.5 rounded-full ${
-                    assistantState === "listening" ? "bg-cyan-400 animate-ping" :
-                    assistantState === "thinking" ? "bg-indigo-400 animate-spin" :
-                    assistantState === "speaking" ? "bg-amber-400" :
-                    "bg-[#8A8F98]"
-                  }`} />
-                  {orbConfig.label}
-                </span>
+              {/* Mic & AI Status widget */}
+              <div className="flex items-center gap-3">
+                {/* Candidate Mic Equalizer Widget */}
+                <div className="flex items-center gap-2 bg-[#EEEEEE] px-3 py-1.5 rounded-xl border-2 border-[#0B0909] shadow-sm h-8">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      playAestheticClick();
+                      setMicOn(!micOn);
+                    }}
+                    className={`p-0.5 rounded-md transition-colors cursor-pointer text-[#0B0909] hover:bg-[#0B0909]/5`}
+                    title={micOn ? "Mute Microphone" : "Unmute Microphone"}
+                  >
+                    {micOn ? <Mic className="size-3.5" /> : <MicOff className="size-3.5" />}
+                  </button>
+                  <div className="flex items-end gap-[2px] h-4">
+                    {[...Array(5)].map((_, i) => (
+                      <div 
+                        key={i} 
+                        style={getEqualizerStyle(i)}
+                        className="w-1 bg-[#0B0909] rounded-full"
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                {/* AI Status Badge */}
+                <div className="flex flex-col items-end">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-extrabold px-2.5 py-1 rounded-full border-2 border-[#0B0909] bg-[#EEEEEE]">
+                    <span className={`size-1.5 rounded-full ${
+                      assistantState === "listening" ? "bg-cyan-500 animate-ping" :
+                      assistantState === "thinking" ? "bg-indigo-500 animate-spin" :
+                      assistantState === "speaking" ? "bg-amber-500 animate-pulse" :
+                      "bg-[#0B0909]"
+                    }`} />
+                    {orbConfig.label}
+                  </span>
+                </div>
               </div>
             </div>
 
             {/* Orb Visualizer Display */}
             <div className="flex-1 flex flex-col justify-center items-center py-6 relative">
               {/* Outer Pulsing Background Circles */}
-              <div className="absolute size-56 rounded-full bg-transparent flex items-center justify-center pointer-events-none">
+              <div className="absolute size-52 rounded-full bg-transparent flex items-center justify-center pointer-events-none">
                 {assistantState !== "idle" && (
                   <>
                     <div className={`absolute inset-0 rounded-full border-2 ${orbConfig.ringColor} ripple-effect`} />
@@ -712,24 +727,24 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
               </div>
 
               {/* Glow backdrop */}
-              <div className={`absolute size-44 rounded-full bg-gradient-to-tr ${orbConfig.gradient} blur-3xl opacity-35 transition-all duration-700 ${orbConfig.shadowColor} ${orbConfig.scale}`} />
+              <div className={`absolute size-40 rounded-full bg-gradient-to-tr ${orbConfig.gradient} blur-2xl opacity-20 transition-all duration-700 ${orbConfig.shadowColor} ${orbConfig.scale}`} />
 
               {/* The Interactive Orb */}
-              <div className={`relative size-28 bg-gradient-to-tr ${orbConfig.gradient} shadow-2xl transition-all duration-700 morphing-orb ${orbConfig.scale} flex items-center justify-center`}>
+              <div className={`relative size-24 bg-gradient-to-tr ${orbConfig.gradient} shadow-md transition-all duration-700 morphing-orb ${orbConfig.scale} flex items-center justify-center border-2 border-[#0B0909]/20`}>
                 {/* Inner transparent filter */}
-                <div className="absolute inset-1.5 rounded-full bg-black/10 backdrop-blur-[1px] border border-white/10" />
+                <div className="absolute inset-1.5 rounded-full bg-white/20 backdrop-blur-[1px] border border-white/30" />
                 
                 {/* Micro animations of voice frequencies inside the speaking state */}
                 {assistantState === "speaking" && (
                   <div className="flex items-center gap-1 relative z-10">
-                    <span className="w-1 h-6 bg-white rounded-full animate-pulse" />
-                    <span className="w-1 h-10 bg-white rounded-full animate-pulse" style={{ animationDelay: "0.2s" }} />
-                    <span className="w-1 h-5 bg-white rounded-full animate-pulse" style={{ animationDelay: "0.4s" }} />
+                    <span className="w-1 h-5 bg-white rounded-full animate-pulse" />
+                    <span className="w-1 h-8 bg-white rounded-full animate-pulse" style={{ animationDelay: "0.2s" }} />
+                    <span className="w-1 h-4 bg-white rounded-full animate-pulse" style={{ animationDelay: "0.4s" }} />
                   </div>
                 )}
                 {assistantState === "listening" && (
                   <div className="relative z-10">
-                    <span className="flex size-4 items-center justify-center">
+                    <span className="flex size-3 items-center justify-center">
                       <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-40 animate-ping" />
                       <span className="relative inline-flex rounded-full h-2 w-2 bg-white" />
                     </span>
@@ -738,31 +753,31 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
               </div>
 
               {/* Help tip text below the orb */}
-              <span className="text-[10px] text-[#8A8F98] mt-6 tracking-wide max-w-[200px] text-center">
-                {assistantState === "idle" && "Click simulator below to start conversation"}
-                {assistantState === "listening" && "Listening to your response... Speak now"}
+              <span className="text-[10px] text-[#0B0909]/70 mt-5 tracking-wide max-w-[220px] text-center font-bold">
+                {assistantState === "idle" && "Initializing... start speaking"}
+                {assistantState === "listening" && "Listening to you... Speak now"}
                 {assistantState === "thinking" && `${selectedPersona.name} is evaluating...`}
-                {assistantState === "speaking" && `${selectedPersona.name} is asking a question`}
+                {assistantState === "speaking" && `${selectedPersona.name} is speaking`}
               </span>
             </div>
 
             {/* Transcript log list */}
-            <div className="h-[140px] px-6 overflow-hidden overflow-y-auto no-scrollbar space-y-3.5 border-t border-b border-[#1E2024] py-4 bg-[#0E1013]/30">
+            <div className="h-[150px] px-6 overflow-hidden overflow-y-auto no-scrollbar space-y-3.5 border-t border-b-2 border-[#0B0909]/20 py-4 bg-[#EEEEEE]/30">
               {messages.map((msg, index) => (
                 <div 
                   key={index} 
                   className={`flex flex-col ${msg.sender === "user" ? "items-end" : "items-start"}`}
                 >
                   <div className="flex items-center gap-1.5 mb-1">
-                    <span className="text-[9px] uppercase tracking-wider text-[#8A8F98] font-bold">
+                    <span className="text-[9px] uppercase tracking-wider text-[#0B0909]/70 font-bold">
                       {msg.sender === "user" ? "Candidate" : selectedPersona.name}
                     </span>
-                    <span className="text-[8px] text-[#5A5F68]">{msg.timestamp}</span>
+                    <span className="text-[8px] text-neutral-500">{msg.timestamp}</span>
                   </div>
-                  <div className={`text-xs px-3.5 py-2 rounded-2xl max-w-[85%] leading-relaxed break-words overflow-hidden ${
+                  <div className={`text-xs px-3.5 py-2.5 rounded-2xl max-w-[85%] leading-relaxed break-words overflow-hidden ${
                     msg.sender === "user" 
-                      ? "bg-[#C17F3B]/10 border border-[#C17F3B]/20 text-[#F5F0E8] rounded-tr-none" 
-                      : "bg-[#16181C] border border-[#2A2D33]/60 text-[#F5F0E8] rounded-tl-none shadow-[0_1px_2px_rgba(0,0,0,0.2)]"
+                      ? "bg-[#0B0909] text-[#FBEFEF] border border-[#0B0909] rounded-tr-none shadow-sm" 
+                      : "bg-[#EEEEEE] border-2 border-[#0B0909] text-[#0B0909] rounded-tl-none shadow-sm"
                   }`}>
                     {msg.text}
                   </div>
@@ -779,83 +794,20 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
                 onChange={(e) => setTextInput(e.target.value)}
                 placeholder={assistantState === "listening" ? "Type your response here..." : "Wait for AI or type answer..."}
                 disabled={assistantState === "thinking"}
-                className="flex-1 bg-[#16181C] border border-[#2A2D33] rounded-lg text-xs py-2.5 px-3.5 text-[#F5F0E8] placeholder-[#5A5F68] focus:outline-none focus:border-[#C17F3B]/60 focus:ring-1 focus:ring-[#C17F3B]/40 disabled:opacity-50 transition-colors"
+                className="flex-1 bg-white border-2 border-[#0B0909] rounded-xl text-xs py-2.5 px-3.5 text-[#0B0909] placeholder-[#0B0909]/40 focus:outline-none focus:border-[#0B0909] focus:ring-1 focus:ring-[#0B0909]/40 disabled:opacity-50 transition-colors"
               />
               <button
                 type="submit"
+                onClick={playAestheticClick}
                 disabled={!textInput.trim() || assistantState === "thinking"}
-                className="flex items-center justify-center p-2.5 rounded-lg bg-[#C17F3B] hover:bg-[#D18F4B] active:bg-[#B0722F] text-[#0B0C0E] transition-colors disabled:opacity-40 disabled:pointer-events-none cursor-pointer"
+                className="flex items-center justify-center p-2.5 rounded-xl bg-[#0B0909] hover:bg-[#0B0909]/95 text-[#FBEFEF] border border-[#0B0909] transition-colors disabled:opacity-40 disabled:pointer-events-none cursor-pointer shadow-[2px_2px_0px_0px_#EEEEEE]"
               >
                 <Send className="size-3.5" />
               </button>
             </form>
 
           </Card>
-
-          {/* SIMULATOR ACTION CONTROL PANEL */}
-          <Card className="bg-[#121418]/60 border-[#1E2024] p-4 flex flex-col gap-3.5 shadow-sm">
-            <div className="flex items-center justify-between border-b border-[#2A2D33]/40 pb-2">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-[#8A8F98] flex items-center gap-1.5">
-                <Activity className="size-3.5 text-[#C17F3B]" />
-                Prototype Controller & State Simulator
-              </span>
-              <button 
-                type="button"
-                onClick={handleResetSession}
-                className="text-[9px] uppercase tracking-wider font-semibold text-[#8A8F98] hover:text-[#F5F0E8] flex items-center gap-1 cursor-pointer transition-colors"
-                title="Reset Session"
-              >
-                <RotateCcw className="size-2.5" /> Reset
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                className="text-[11px] h-8 justify-start gap-1.5 text-[#8A8F98] hover:text-[#F5F0E8] hover:bg-[#1C1F24] cursor-pointer"
-                onClick={() => handleSimulateState("idle")}
-              >
-                <div className="size-2 rounded-full bg-slate-500" />
-                Trigger Standby
-              </Button>
-              
-              <Button
-                variant="outline"
-                size="sm"
-                className="text-[11px] h-8 justify-start gap-1.5 text-[#8A8F98] hover:text-[#F5F0E8] hover:bg-[#1C1F24] cursor-pointer"
-                onClick={() => handleSimulateState("listening")}
-              >
-                <div className="size-2 rounded-full bg-cyan-400" />
-                Trigger Listening
-              </Button>
-
-              <Button
-                variant="outline"
-                size="sm"
-                className="text-[11px] h-8 justify-start gap-1.5 text-[#8A8F98] hover:text-[#F5F0E8] hover:bg-[#1C1F24] cursor-pointer"
-                onClick={() => handleSimulateState("thinking")}
-              >
-                <div className="size-2 rounded-full bg-indigo-500" />
-                Trigger Thinking
-              </Button>
-
-              <Button
-                variant="outline"
-                size="sm"
-                className="text-[11px] h-8 justify-start gap-1.5 text-[#8A8F98] hover:text-[#F5F0E8] hover:bg-[#1C1F24] cursor-pointer"
-                onClick={() => handleSimulateState("speaking")}
-              >
-                <div className="size-2 rounded-full bg-amber-500" />
-                AI Ask Next Question
-              </Button>
-            </div>
-            <p className="text-[10px] text-[#8A8F98]/80 text-center italic mt-0.5">
-              Type in the input and click Send to simulate a conversational response cycle!
-            </p>
-          </Card>
         </section>
-
       </main>
     </div>
   );
