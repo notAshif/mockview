@@ -77,3 +77,31 @@ Mockview implements a state-of-the-art Web Audio pipeline designed for ultra-low
 1. **Web Audio Block Constraint**: AudioWorklet process callbacks are strictly locked to **128 frames**. To stream custom buffer sizes (e.g. 256 or 512) required by the target API, buffer accumulation must be manually handled using internal arrays inside the processor class.
 2. **Audio Worklet Limitations**: The `AudioWorkletGlobalScope` is highly restricted. It does not have access to standard utilities like `btoa()` for base64 encoding or network sockets like `WebSocket`. Thus, a two-phase architecture (Worker processing -> Main thread sending) is required.
 3. **Audio Context Autoplay Rules**: Modern browsers block programmatically started audio. Resuming `AudioContext` dynamically upon user gesture (e.g. microphone stream initiation) is critical to prevent playback failure.
+
+---
+
+## 🐳 Docker Compose Setup
+
+Mockview can be built and run locally using Docker and Docker Compose. This automatically spins up a local PostgreSQL database, runs migrations, and starts both the frontend and backend services.
+
+### Prerequisites
+Make sure you have [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/) installed on your machine.
+
+### Running the Project
+To build and start the entire workspace, run the following command in the root directory:
+
+```bash
+docker-compose up --build
+```
+
+This will start:
+- **PostgreSQL Database** (`db`) on port `5432`
+- **Express Backend** (`backend`) on port `3002` (linked to PostgreSQL and auto-generating the database schema)
+- **React Frontend** (`frontend`) on port `3000`
+
+### Environment Variables
+By default, the backend will use the API key specified in the Compose file configuration, but you can override it using your host environment or host `.env` file:
+
+```bash
+GEMINI_API_KEY="your-api-key" docker-compose up --build
+```
