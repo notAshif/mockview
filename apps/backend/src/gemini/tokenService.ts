@@ -67,6 +67,12 @@ export async function mintEphemeralToken(
             },
             input_audio_transcription: {},
             output_audio_transcription: {},
+            realtime_input_config: {
+              automatic_activity_detection: {
+                disabled: false,
+                silence_duration_ms: 700,
+              },
+            },
           },
         },
       },

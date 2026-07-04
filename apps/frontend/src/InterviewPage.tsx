@@ -33,6 +33,53 @@ async function parseGeminiWsMessage(data: string | Blob | ArrayBuffer): Promise<
   return JSON.parse(text);
 }
 
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...new Uint8Array(chunk));
+  }
+  return window.btoa(binary);
+}
+
+const workletCode = `
+class AudioStreamProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.bufferSize = (options && options.processorOptions && options.processorOptions.bufferSize) || 256;
+    this.buffer = new Float32Array(this.bufferSize);
+    this.bufferIndex = 0;
+  }
+
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+
+    const channelData = input[0];
+    const sampleCount = channelData.length;
+
+    for (let i = 0; i < sampleCount; i++) {
+      this.buffer[this.bufferIndex++] = channelData[i];
+      if (this.bufferIndex >= this.bufferSize) {
+        const int16Buffer = new Int16Array(this.bufferSize);
+        for (let j = 0; j < this.bufferSize; j++) {
+          const s = Math.max(-1, Math.min(1, this.buffer[j]));
+          int16Buffer[j] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        this.port.postMessage(int16Buffer.buffer, [int16Buffer.buffer]);
+        this.bufferIndex = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('audio-stream-processor', AudioStreamProcessor);
+`;
+
+
 // CSS Animations
 const customStyles = `
 @keyframes morph-orb {
@@ -113,6 +160,7 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
 
   // Audio recording (capture and stream to Gemini directly)
   const recorderContextRef = useRef<AudioContext | null>(null);
+  const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
 
@@ -287,7 +335,7 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
           mediaChunks: [
             {
               mimeType: "audio/pcm;rate=16000",
-              data: btoa(String.fromCharCode(...new Uint8Array(pcm.buffer))),
+              data: arrayBufferToBase64(pcm.buffer),
             },
           ],
         },
@@ -354,6 +402,12 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
               voiceConfig: {
                 prebuiltVoiceConfig: { voiceName: "Aoede" },
               },
+            },
+          },
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: false,
+              silenceDurationMs: 700,
             },
           },
         },
