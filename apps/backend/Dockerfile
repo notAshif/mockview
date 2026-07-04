@@ -21,15 +21,14 @@ RUN bun install
 COPY apps/backend ./apps/backend
 COPY packages ./packages
 
+# Create a symlink to hoisted dependencies to resolve nested workspace lookups
+RUN ln -s /usr/src/app/node_modules /usr/src/app/apps/backend/node_modules
+
 # Expose backend port
 EXPOSE 3002
 
 # Run from the backend directory
 WORKDIR /usr/src/app/apps/backend
 
-# Generate Prisma client
-ENV DATABASE_URL="postgresql://postgres:postgres@localhost:5432/mockview?schema=public"
-RUN bunx --bun prisma generate
-
-# On start, push schema changes to Postgres database and run backend dev server
-CMD ["sh", "-c", "bunx --bun prisma db push && bun run dev"]
+# On start, generate the Prisma client, push schema changes to Postgres database, and run backend dev server
+CMD ["sh", "-c", "bun run prisma generate && bun run prisma db push && bun run dev"]

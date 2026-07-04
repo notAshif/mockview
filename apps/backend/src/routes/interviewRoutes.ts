@@ -37,7 +37,7 @@ router.post(
   "/interviews/:id/log",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { id } = req.params;
+      const id = req.params.id as string;
       const { sender, text } = req.body as { sender?: string; text?: string };
 
       if (!sender || !text) {
@@ -64,8 +64,8 @@ router.post(
   "/interviews/:id/end",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { id } = req.params;
-      const result = await endInterview(id!);
+      const id = req.params.id as string;
+      const result = await endInterview(id);
       res.json(result);
     } catch (err) {
       next(err);
@@ -79,8 +79,8 @@ router.get(
   "/interviews/:id",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { id } = req.params;
-      const result = await getInterview(id!);
+      const id = req.params.id as string;
+      const result = await getInterview(id);
       res.json(result);
     } catch (err) {
       next(err);
@@ -94,8 +94,8 @@ router.get(
   "/interviews/:id/logs",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { id } = req.params;
-      const logs = await getInterviewLogs(id!);
+      const id = req.params.id as string;
+      const logs = await getInterviewLogs(id);
       res.json({ logs });
     } catch (err) {
       next(err);

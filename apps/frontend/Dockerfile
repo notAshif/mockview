@@ -29,4 +29,4 @@ ENV HOST=0.0.0.0
 WORKDIR /usr/src/app/apps/frontend
 
 # Start frontend dev server
-CMD ["bun", "run", "dev"]
+CMD ["bun", "run", "dev", "--host", "0.0.0.0", "--port", "3000"]
