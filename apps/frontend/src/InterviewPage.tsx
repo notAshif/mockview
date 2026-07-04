@@ -371,8 +371,9 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
         const response = (await parseGeminiWsMessage(event.data)) as Record<string, unknown>;
 
         // ── Input transcription (user's spoken words via Gemini STT) ──────────
-        if (response.inputTranscription) {
-          const { text, turnComplete } = response.inputTranscription as {text: string, turnComplete: string};
+        const inputTranscription = (response.inputTranscription || (response.serverContent as any)?.inputTranscription) as Record<string, any> | undefined;
+        if (inputTranscription) {
+          const { text, turnComplete } = inputTranscription;
           if (text) {
             currentUserUtteranceRef.current += text + " ";
           }
@@ -469,8 +470,9 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
         }
 
         // ── Output transcription (assistant text via Gemini TTS transcript) ──
-        if (response.outputTranscription) {
-          const { text, turnComplete } = response.outputTranscription;
+        const outputTranscription = (response.outputTranscription || (response.serverContent as any)?.outputTranscription) as Record<string, any> | undefined;
+        if (outputTranscription) {
+          const { text, turnComplete } = outputTranscription;
           if (text) {
             currentAssistantUtteranceRef.current += text + " ";
             setMessages((prev) => {
@@ -501,6 +503,37 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
         if (response.setupComplete) {
           console.log("[Client] Gemini setup complete, AI is ready");
           setAssistantState("listening");
+
+          // Send an initial greeting to trigger the assistant's introduction based on the persona
+          const personaName = sessionInfo?.persona === "marcus"
+            ? "Marcus Vance"
+            : sessionInfo?.persona === "sarah"
+              ? "Sarah Chen"
+              : "Elena Rostova";
+          const personaRole = sessionInfo?.persona === "marcus"
+            ? "HR Behavioral Lead"
+            : sessionInfo?.persona === "sarah"
+              ? "Frontend Tech Lead"
+              : "System Design Expert";
+
+          console.log("[Client] Triggering assistant intro greeting");
+          geminiWs.send(
+            JSON.stringify({
+              clientContent: {
+                turns: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        text: `Hello! I am ready for the mock interview. Please introduce yourself as ${personaName}, the ${personaRole}, explain what you will be assessing, and ask me to start by introducing myself.`,
+                      },
+                    ],
+                  },
+                ],
+                turnComplete: true,
+              },
+            })
+          );
         }
 
       } catch (err) {
