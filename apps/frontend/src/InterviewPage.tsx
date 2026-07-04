@@ -307,48 +307,95 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
   // ─────────────────────────────────────────────────────────────────────────────
   // Microphone Recording — capture and stream 16kHz PCM directly to Gemini WS
   // ─────────────────────────────────────────────────────────────────────────────
-  const startRecording = useCallback((geminiWs: WebSocket, stream: MediaStream) => {
+  const startRecording = useCallback(async (geminiWs: WebSocket, stream: MediaStream) => {
     if (recorderContextRef.current) return;
 
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     const audioContext = new AudioContextClass({ sampleRate: 16000 });
     recorderContextRef.current = audioContext;
 
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
     const src = audioContext.createMediaStreamSource(stream);
     sourceRef.current = src;
 
-    const processor = audioContext.createScriptProcessor(2048, 1, 1);
-    processorRef.current = processor;
-
-    processor.onaudioprocess = (e) => {
-      if (geminiWs.readyState !== WebSocket.OPEN) return;
-      const inputData = e.inputBuffer.getChannelData(0);
-      const pcm = new Int16Array(inputData.length);
-      for (let i = 0; i < inputData.length; i++) {
-        const s = Math.max(-1, Math.min(1, inputData[i]!));
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    let useWorklet = false;
+    if (audioContext.audioWorklet) {
+      try {
+        const blob = new Blob([workletCode], { type: "application/javascript" });
+        const workletUrl = URL.createObjectURL(blob);
+        await audioContext.audioWorklet.addModule(workletUrl);
+        URL.revokeObjectURL(workletUrl);
+        useWorklet = true;
+      } catch (e) {
+        console.warn("[Client] Failed to load AudioWorklet, falling back to ScriptProcessor:", e);
       }
+    }
 
-      // Send audio directly to Gemini as realtimeInput mediaChunks
-      const msg = {
-        realtimeInput: {
-          mediaChunks: [
-            {
-              mimeType: "audio/pcm;rate=16000",
-              data: arrayBufferToBase64(pcm.buffer),
-            },
-          ],
-        },
+    if (useWorklet) {
+      const workletNode = new AudioWorkletNode(audioContext, "audio-stream-processor", {
+        processorOptions: { bufferSize: 256 },
+      });
+      audioWorkletNodeRef.current = workletNode;
+
+      workletNode.port.onmessage = (event) => {
+        if (geminiWs.readyState !== WebSocket.OPEN) return;
+        const arrayBuffer = event.data as ArrayBuffer;
+        const base64 = arrayBufferToBase64(arrayBuffer);
+
+        const msg = {
+          realtimeInput: {
+            mediaChunks: [
+              {
+                mimeType: "audio/pcm;rate=16000",
+                data: base64,
+              },
+            ],
+          },
+        };
+        geminiWs.send(JSON.stringify(msg));
       };
-      geminiWs.send(JSON.stringify(msg));
-    };
 
-    src.connect(processor);
-    processor.connect(audioContext.destination);
-    console.log("[Client] Audio streaming started at 16kHz PCM → Gemini");
+      src.connect(workletNode);
+      workletNode.connect(audioContext.destination);
+      console.log("[Client] Audio streaming started at 16kHz PCM using AudioWorklet (buffer: 256) → Gemini");
+    } else {
+      const processor = audioContext.createScriptProcessor(256, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if (geminiWs.readyState !== WebSocket.OPEN) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]!));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+
+        const msg = {
+          realtimeInput: {
+            mediaChunks: [
+              {
+                mimeType: "audio/pcm;rate=16000",
+                data: arrayBufferToBase64(pcm.buffer),
+              },
+            ],
+          },
+        };
+        geminiWs.send(JSON.stringify(msg));
+      };
+
+      src.connect(processor);
+      processor.connect(audioContext.destination);
+      console.log("[Client] Audio streaming started at 16kHz PCM using ScriptProcessor (buffer: 256) → Gemini");
+    }
   }, []);
 
   const stopRecording = useCallback(() => {
+    audioWorkletNodeRef.current?.disconnect();
+    audioWorkletNodeRef.current = null;
     processorRef.current?.disconnect();
     processorRef.current = null;
     sourceRef.current?.disconnect();
@@ -468,10 +515,11 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
         }
 
         // ── Server content (assistant's audio + text response) ────────────────
-        if (response.serverContent) {
+        const serverContent = response.serverContent as any;
+        if (serverContent) {
           setAssistantState("speaking");
 
-          const modelTurn = response.serverContent.modelTurn;
+          const modelTurn = serverContent.modelTurn;
           if (modelTurn?.parts) {
             for (const part of modelTurn.parts) {
               // Play audio
@@ -504,7 +552,7 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
           }
 
           // Interruption — user started speaking, stop assistant audio
-          if (response.serverContent.interrupted) {
+          if (serverContent.interrupted) {
             console.log("[Client] Assistant interrupted");
             stopAllPlayback();
             setAssistantState("listening");
@@ -512,7 +560,7 @@ export function InterviewPage({ onExit }: { onExit: () => void }) {
           }
 
           // Turn complete — persist assistant utterance to backend
-          if (response.serverContent.turnComplete) {
+          if (serverContent.turnComplete) {
             const finalAssistant = currentAssistantUtteranceRef.current.trim();
             if (finalAssistant) {
               console.log(`[TTS Assistant]: ${finalAssistant}`);
