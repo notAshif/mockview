@@ -13,7 +13,7 @@
   },
   "scripts": {
     "dev": "bun run ./index.ts",
-    "prisma": "prisma"
+    "prisma": "bun ./node_modules/prisma/build/index.js"
   },
   "peerDependencies": {
     "typescript": "^5"

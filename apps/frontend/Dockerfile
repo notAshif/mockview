@@ -2,7 +2,7 @@
 FROM oven/bun:1.3.11-alpine AS base
 WORKDIR /usr/src/app
 
-# Copy lock and root package files
+# Copy root workspace files
 COPY package.json bun.lock ./
 
 # Copy package configurations for monorepo resolution
@@ -11,12 +11,12 @@ COPY packages/eslint-config/package.json ./packages/eslint-config/
 COPY packages/typescript-config/package.json ./packages/typescript-config/
 COPY packages/ui/package.json ./packages/ui/
 
-# Install dependencies
-RUN bun install
-
-# Copy monorepo source files
+# Copy monorepo source files (node_modules excluded via .dockerignore)
 COPY apps/frontend ./apps/frontend
 COPY packages ./packages
+
+# Install dependencies AFTER copying source so Bun symlinks are not overwritten
+RUN bun install
 
 # Expose frontend port
 EXPOSE 3000
