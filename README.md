@@ -1,159 +1,79 @@
-# Turborepo starter
+# Mockview - AI Interview Simulator
 
-This Turborepo starter is maintained by the Turborepo core team.
+Mockview is a premium, real-time AI Interview Simulator that simulates professional job interviews using the Gemini Live API. It supports bidirectional, ultra-low latency voice conversations, dynamic persona selection, live metrics, and real-time response transcriptions.
 
-## Using this example
+---
 
-Run the following command:
+## 🏗️ Project Architecture
 
-```sh
-npx create-turbo@latest
+Mockview is organized as a high-performance **TypeScript monorepo** managed by **Turborepo** and powered by **Bun**.
+
+```
+mockview/
+├── apps/
+│   ├── frontend/        # React + TypeScript single-page app (UI and Audio pipelines)
+│   └── backend/         # Express + Node.js backend (Session Management & Ephemeral Token Minting)
+└── packages/
+    ├── eslint-config/   # Monorepo-wide Linting configuration
+    ├── typescript-config/ # TypeScript configurations
+    └── ui/              # Shared component library
 ```
 
-## What's inside?
+---
 
-This Turborepo includes the following packages/apps:
+## 🎙️ Low-Latency Audio Streaming Pipeline
 
-### Apps and Packages
+Mockview implements a state-of-the-art Web Audio pipeline designed for ultra-low latency bidirectional communication, replacing record-and-upload workflows with continuous streaming.
 
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `eslint-config-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
-
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+```
++------------+      +-------------------+      +----------------------+      +-------------+
+| Microphone | ---> |    AudioContext   | ---> | AudioWorkletProcessor| ---> | Main Thread |
+| (User Voc) |      | (Mono @ 16000 Hz) |      | (Float32 -> Int16)   |      | (Base64 En) |
++------------+      +-------------------+      +----------------------+      +-------------+
+                                                                                    |
+                                                                                    v
++------------+      +-------------------+      +----------------------+      +-------------+
+| AI Playback| <--- |  Gapless Decoder  | <--- |     Gemini Live      | <--- |  WebSocket  |
+|  (Speaker) |      | (24kHz Mono Play) |      |      WS Server       |      | Transmission|
++------------+      +-------------------+      +----------------------+      +-------------+
 ```
 
-Without global `turbo`, use your package manager:
+### 1. Audio Capture (Input)
+- **Sample Rate**: Captures raw audio via `navigator.mediaDevices.getUserMedia` at **16000 Hz** mono.
+- **Processing Thread (`AudioWorklet`)**:
+  - Offloads real-time sample processing from the main UI thread to the audio rendering thread using `AudioWorkletNode`.
+  - Captures input in standard 128-frame blocks and accumulates them into a **256-frame buffer** (the optimal balance between latency and transmission stability).
+  - Converts raw `Float32` samples to **Int16 PCM** directly in the worklet thread.
+  - Passes the Int16 buffer back to the main thread using **transferable objects** (`port.postMessage(buffer, [buffer])`) to achieve zero-copy memory transfers.
+- **Fallback**: Automatically falls back to a legacy `ScriptProcessorNode` with a matching `256` buffer size if the user's browser does not support `AudioWorklet` or runs in a non-secure context.
+- **WebSocket Streaming**: In the main thread, the buffer is base64 encoded and sent immediately as a JSON payload without batching or silence waiting.
 
-```sh
-cd my-turborepo
-npx turbo build
-bun dlx turbo build
-bun exec turbo build
-```
+### 2. Audio Playback (Output)
+- Decodes incoming base64 **24kHz Int16 PCM** chunks incrementally as they arrive.
+- Converts the chunks to `Float32` format and streams them using a gapless playback schedule (`nextPlaybackTimeRef.current`), preventing audio jitter or pauses.
+- Instantly handles interruptions: stops playback and clears buffers the millisecond an interruption flag is received.
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+---
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+## 🧠 Key Design Decisions
 
-```sh
-turbo build --filter=docs
-```
+### 🚀 Inline Worklet Module Compilation
+- **Problem**: Loading worklets typically requires static files served from the public directory. In bundled React/Vite/Bun setups, this requires modifying complex build configurations to avoid compiling or renaming the worklet file.
+- **Solution**: We declared the `AudioStreamProcessor` class inside `InterviewPage.tsx` as an inline template string (`workletCode`). At runtime, we create a dynamic URL via a temporary Blob (`URL.createObjectURL(new Blob([workletCode]))`) to register the module. The object URL is revoked immediately after loading. This ensures 100% environment-agnostic compilation.
 
-Without global `turbo`:
+### ⚙️ Offloaded Float32-to-Int16 Downsampling
+- Heavy mathematical array operations inside high-frequency callback functions trigger Garbage Collection (GC) sweeps. By moving the downsampling loop into the browser's audio processing thread inside the `AudioWorkletProcessor`, the main thread is freed up for UI updates and WebSocket tasks.
 
-```sh
-npx turbo build --filter=docs
-bun exec turbo build --filter=docs
-bun exec turbo build --filter=docs
-```
+### 🧬 Transferable ArrayBuffers
+- Standard `postMessage` copies arrays, creating memory overhead. By specifying the `ArrayBuffer` in the transfer list of `postMessage`, ownership is directly transferred. This reduces memory footprint and Garbage Collection pressure.
 
-### Develop
+### 🛡️ TypeScript Interface Casting
+- Cast `response.serverContent` as `any` prior to property access to allow clean type checking under strict compiler conditions without needing massive interface declarations.
 
-To develop all apps and packages, run the following command:
+---
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+## 📖 Engineering Learnings
 
-```sh
-cd my-turborepo
-turbo dev
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo dev
-bun exec turbo dev
-bun exec turbo dev
-```
-
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo dev --filter=web
-bun exec turbo dev --filter=web
-bun exec turbo dev --filter=web
-```
-
-### Remote Caching
-
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
-bun exec turbo login
-bun exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-bun exec turbo link
-bun exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+1. **Web Audio Block Constraint**: AudioWorklet process callbacks are strictly locked to **128 frames**. To stream custom buffer sizes (e.g. 256 or 512) required by the target API, buffer accumulation must be manually handled using internal arrays inside the processor class.
+2. **Audio Worklet Limitations**: The `AudioWorkletGlobalScope` is highly restricted. It does not have access to standard utilities like `btoa()` for base64 encoding or network sockets like `WebSocket`. Thus, a two-phase architecture (Worker processing -> Main thread sending) is required.
+3. **Audio Context Autoplay Rules**: Modern browsers block programmatically started audio. Resuming `AudioContext` dynamically upon user gesture (e.g. microphone stream initiation) is critical to prevent playback failure.
