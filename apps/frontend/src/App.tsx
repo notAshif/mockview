@@ -5,10 +5,12 @@ import { InterviewPage } from "./InterviewPage";
 
 export function App() {
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
+  const [currentSearch, setCurrentSearch] = useState(window.location.search);
 
   useEffect(() => {
     const handlePopState = () => {
       setCurrentPath(window.location.pathname);
+      setCurrentSearch(window.location.search);
     };
     window.addEventListener("popstate", handlePopState);
     return () => {
@@ -18,7 +20,12 @@ export function App() {
 
   const navigate = (path: string) => {
     window.history.pushState({}, "", path);
-    setCurrentPath(path);
+    setCurrentPath(window.location.pathname);
+    setCurrentSearch(window.location.search);
+  };
+
+  const handleStart = (interviewId: string, persona: string) => {
+    navigate(`/interview?id=${interviewId}&persona=${persona}`);
   };
 
   return (
@@ -26,7 +33,7 @@ export function App() {
       {currentPath.startsWith("/interview") ? (
         <InterviewPage onExit={() => navigate("/")} />
       ) : (
-        <Welcome onStart={(id) => navigate(`/interview?id=${id}`)} />
+        <Welcome onStart={handleStart} />
       )}
     </>
   );

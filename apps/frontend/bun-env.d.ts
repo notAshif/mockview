@@ -8,6 +8,12 @@ declare module "*.svg" {
   export = path;
 }
 
+declare module '*.jpg';
+declare module '*.jpeg';
+declare module '*.png';
+declare module '*.svg';
+declare module '*.gif';
+
 declare module "*.module.css" {
   /**
    * A record of class names to their corresponding CSS module classes

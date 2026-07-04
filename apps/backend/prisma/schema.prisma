@@ -24,7 +24,11 @@ model Interview {
   userId       String?
   user         User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
   status       String         @default("IN_PROGRESS") // IN_PROGRESS, COMPLETED
+  persona      String         @default("elena") // elena, marcus, sarah
   systemPrompt String?
+  duration     Int?           // seconds, computed on interview end
+  score        Int?           // 0-100, computed from transcript heuristics
+  feedback     String?        // brief qualitative summary
   logs         InterviewLog[]
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
